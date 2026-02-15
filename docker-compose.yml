@@ -1,6 +1,19 @@
 version: '3.8'
 
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
     build: ./backend
     ports:
@@ -9,6 +22,18 @@ services:
       - backend-jobs:/app/jobs
     environment:
       - FLASK_ENV=production
+      - REDIS_URL=redis://redis:6379/0
+      - PROXY_FIX_X_FOR=1
+      - PROXY_FIX_X_PROTO=1
+      # Rate limit configuration (customize as needed)
+      - RATE_LIMIT_DEFAULT=200 per hour
+      - RATE_LIMIT_JOBS_CREATE=5 per hour
+      - RATE_LIMIT_JOBS_CREATE_BURST=2 per minute
+      - RATE_LIMIT_JOBS_STATUS=60 per minute
+      - RATE_LIMIT_JOBS_DOWNLOAD=10 per minute
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -24,3 +49,4 @@ services:
 
 volumes:
   backend-jobs:
+  redis-data:
