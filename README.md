@@ -122,6 +122,16 @@ curl -O http://localhost:5001/jobs/{job_id}/download.pdf
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLASK_ENV` | `development` | Flask environment |
+| `REDIS_URL` | (none) | Redis URL for rate limiting storage (e.g., `redis://localhost:6379/0`). Falls back to in-memory if not set. |
+| `PROXY_FIX_X_FOR` | `1` | Number of reverse proxies setting X-Forwarded-For |
+| `PROXY_FIX_X_PROTO` | `1` | Number of reverse proxies setting X-Forwarded-Proto |
+| `PROXY_FIX_X_HOST` | `0` | Number of reverse proxies setting X-Forwarded-Host |
+| `PROXY_FIX_X_PREFIX` | `0` | Number of reverse proxies setting X-Forwarded-Prefix |
+| `RATE_LIMIT_DEFAULT` | `200 per hour` | Default rate limit for all endpoints |
+| `RATE_LIMIT_JOBS_CREATE` | `5 per hour` | Rate limit for POST /jobs |
+| `RATE_LIMIT_JOBS_CREATE_BURST` | `2 per minute` | Burst limit for POST /jobs |
+| `RATE_LIMIT_JOBS_STATUS` | `60 per minute` | Rate limit for GET /jobs/<id> |
+| `RATE_LIMIT_JOBS_DOWNLOAD` | `10 per minute` | Rate limit for download endpoints |
 
 ## Project Structure
 
@@ -161,6 +171,85 @@ python cleanup.py --ttl 12
 
 # Delete jobs older than 24 hours (default)
 python cleanup.py
+```
+
+## Rate Limiting
+
+The API includes rate limiting to protect against abuse. Limits are applied per client IP address.
+
+### Default Limits
+
+| Endpoint | Limit | Description |
+|----------|-------|-------------|
+| `POST /jobs` | 5/hour + 2/minute burst | Strict limit on job creation |
+| `GET /jobs/<id>` | 60/minute | Moderate limit for status polling |
+| `GET /jobs/<id>/download.zip` | 10/minute | Moderate limit for downloads |
+| `GET /jobs/<id>/download.pdf` | 10/minute | Moderate limit for downloads |
+| All other endpoints | 200/hour | Default global limit |
+| `GET /health` | Unlimited | Health check exempt from limits |
+
+### Rate Limit Response
+
+When a rate limit is exceeded, the API returns HTTP 429:
+
+```json
+{
+  "error": "rate_limited",
+  "message": "Too many requests. Please slow down.",
+  "retry_after_seconds": 60
+}
+```
+
+The `Retry-After` header is also included when available.
+
+### Storage Backends
+
+**Production (with Redis):**
+
+```bash
+# Set REDIS_URL to use Redis for distributed rate limiting
+export REDIS_URL=redis://localhost:6379/0
+python app.py
+```
+
+When using Docker Compose, Redis is automatically configured.
+
+**Local Development (without Redis):**
+
+```bash
+# No REDIS_URL = in-memory storage (single process only)
+python app.py
+```
+
+In-memory storage works fine for local development but doesn't persist across restarts or work with multiple processes.
+
+### Customizing Limits
+
+Override limits via environment variables:
+
+```bash
+# Stricter limits for production
+export RATE_LIMIT_DEFAULT="100 per hour"
+export RATE_LIMIT_JOBS_CREATE="3 per hour"
+export RATE_LIMIT_JOBS_CREATE_BURST="1 per minute"
+export RATE_LIMIT_JOBS_STATUS="30 per minute"
+export RATE_LIMIT_JOBS_DOWNLOAD="5 per minute"
+
+# Or in docker-compose.yml
+environment:
+  - RATE_LIMIT_JOBS_CREATE=10 per hour
+```
+
+### Reverse Proxy Configuration
+
+When deployed behind a reverse proxy (Render, Fly, Railway, nginx), configure ProxyFix to correctly identify client IPs:
+
+```bash
+# Default: trust 1 proxy setting X-Forwarded-For
+export PROXY_FIX_X_FOR=1
+
+# If behind 2 proxies (e.g., CDN + load balancer)
+export PROXY_FIX_X_FOR=2
 ```
 
 ## Deployment
