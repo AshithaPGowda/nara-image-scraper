@@ -14,13 +14,109 @@ import uuid
 import zipfile
 import threading
 from datetime import datetime
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, g
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from downloader import download_range
 
 app = Flask(__name__)
+
+# ============================================================================
+# Reverse Proxy Configuration
+# ============================================================================
+# When deployed behind a reverse proxy (Render, Fly, Railway, nginx), the
+# proxy sets X-Forwarded-For headers. ProxyFix extracts the real client IP.
+# Configure via environment variables:
+#   PROXY_FIX_X_FOR=1    - Number of proxies setting X-Forwarded-For
+#   PROXY_FIX_X_PROTO=1  - Number of proxies setting X-Forwarded-Proto
+#   PROXY_FIX_X_HOST=1   - Number of proxies setting X-Forwarded-Host
+#   PROXY_FIX_X_PREFIX=1 - Number of proxies setting X-Forwarded-Prefix
+proxy_x_for = int(os.environ.get("PROXY_FIX_X_FOR", "1"))
+proxy_x_proto = int(os.environ.get("PROXY_FIX_X_PROTO", "1"))
+proxy_x_host = int(os.environ.get("PROXY_FIX_X_HOST", "0"))
+proxy_x_prefix = int(os.environ.get("PROXY_FIX_X_PREFIX", "0"))
+
+if proxy_x_for > 0:
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app,
+        x_for=proxy_x_for,
+        x_proto=proxy_x_proto,
+        x_host=proxy_x_host,
+        x_prefix=proxy_x_prefix
+    )
+
 CORS(app)
+
+# ============================================================================
+# Rate Limiting Configuration
+# ============================================================================
+# Storage backend: Redis if REDIS_URL is set, otherwise in-memory
+# Limits can be customized via environment variables:
+#   RATE_LIMIT_DEFAULT          - Default limit for all endpoints (e.g., "200 per hour")
+#   RATE_LIMIT_JOBS_CREATE      - POST /jobs limit (e.g., "5 per hour")
+#   RATE_LIMIT_JOBS_CREATE_BURST- POST /jobs burst limit (e.g., "2 per minute")
+#   RATE_LIMIT_JOBS_STATUS      - GET /jobs/<id> limit (e.g., "60 per minute")
+#   RATE_LIMIT_JOBS_DOWNLOAD    - Download endpoints limit (e.g., "10 per minute")
+
+REDIS_URL = os.environ.get("REDIS_URL")
+
+if REDIS_URL:
+    storage_uri = REDIS_URL
+else:
+    storage_uri = "memory://"
+
+
+def get_real_ip():
+    """Get the real client IP address, respecting X-Forwarded-For."""
+    return get_remote_address()
+
+
+# Rate limit configuration from environment
+DEFAULT_LIMIT = os.environ.get("RATE_LIMIT_DEFAULT", "200 per hour")
+JOBS_CREATE_LIMIT = os.environ.get("RATE_LIMIT_JOBS_CREATE", "5 per hour")
+JOBS_CREATE_BURST = os.environ.get("RATE_LIMIT_JOBS_CREATE_BURST", "2 per minute")
+JOBS_STATUS_LIMIT = os.environ.get("RATE_LIMIT_JOBS_STATUS", "60 per minute")
+JOBS_DOWNLOAD_LIMIT = os.environ.get("RATE_LIMIT_JOBS_DOWNLOAD", "10 per minute")
+
+limiter = Limiter(
+    key_func=get_real_ip,
+    app=app,
+    storage_uri=storage_uri,
+    default_limits=[DEFAULT_LIMIT],
+    strategy="fixed-window"
+)
+
+
+@app.errorhandler(429)
+def rate_limit_exceeded(e):
+    """Handle rate limit exceeded errors with JSON response."""
+    retry_after = e.description if hasattr(e, 'description') else None
+
+    # Try to extract retry_after from the rate limit info
+    retry_after_seconds = None
+    if hasattr(e, 'retry_after'):
+        retry_after_seconds = int(e.retry_after)
+    elif retry_after and 'Retry-After' in str(retry_after):
+        # Fallback parsing if needed
+        try:
+            retry_after_seconds = int(str(retry_after).split()[-1])
+        except (ValueError, IndexError):
+            pass
+
+    response = jsonify({
+        "error": "rate_limited",
+        "message": "Too many requests. Please slow down.",
+        "retry_after_seconds": retry_after_seconds
+    })
+    response.status_code = 429
+
+    if retry_after_seconds:
+        response.headers["Retry-After"] = str(retry_after_seconds)
+
+    return response
 
 JOBS_DIR = os.path.join(os.path.dirname(__file__), "jobs")
 MAX_PAGES = 800
@@ -164,6 +260,8 @@ def run_download_job(job_id: str, catalog_url: str, start_page: int, end_page: i
 
 
 @app.route("/jobs", methods=["POST"])
+@limiter.limit(JOBS_CREATE_LIMIT)
+@limiter.limit(JOBS_CREATE_BURST)
 def create_job():
     """Create a new download job."""
     data = request.get_json()
@@ -232,6 +330,7 @@ def create_job():
 
 
 @app.route("/jobs/<job_id>", methods=["GET"])
+@limiter.limit(JOBS_STATUS_LIMIT)
 def get_job_status(job_id: str):
     """Get the status of a job."""
     status = read_status(job_id)
@@ -241,6 +340,7 @@ def get_job_status(job_id: str):
 
 
 @app.route("/jobs/<job_id>/download.zip", methods=["GET"])
+@limiter.limit(JOBS_DOWNLOAD_LIMIT)
 def download_zip(job_id: str):
     """Download the ZIP archive for a completed job."""
     status = read_status(job_id)
@@ -263,6 +363,7 @@ def download_zip(job_id: str):
 
 
 @app.route("/jobs/<job_id>/download.pdf", methods=["GET"])
+@limiter.limit(JOBS_DOWNLOAD_LIMIT)
 def download_pdf(job_id: str):
     """Download the PDF for a completed job."""
     status = read_status(job_id)
@@ -288,6 +389,7 @@ def download_pdf(job_id: str):
 
 
 @app.route("/health", methods=["GET"])
+@limiter.exempt
 def health_check():
     """Health check endpoint."""
     return jsonify({"status": "ok"})
