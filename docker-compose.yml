@@ -29,6 +29,7 @@ services:
       - RATE_LIMIT_DEFAULT=200 per hour
       - RATE_LIMIT_JOBS_CREATE=5 per hour
       - RATE_LIMIT_JOBS_CREATE_BURST=2 per minute
+      - RATE_LIMIT_JOBS_BATCH=3 per hour
       - RATE_LIMIT_JOBS_STATUS=60 per minute
       - RATE_LIMIT_JOBS_DOWNLOAD=10 per minute
     depends_on:

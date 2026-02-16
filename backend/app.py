@@ -2,10 +2,13 @@
 Flask backend for NARA Image Scraper.
 
 Endpoints:
-- POST /jobs - Create a new download job
+- POST /jobs - Create a new download job (single range)
+- POST /jobs/batch - Create a batch job with multiple ranges
 - GET /jobs/<job_id> - Get job status
 - GET /jobs/<job_id>/download.zip - Download completed ZIP archive
 - GET /jobs/<job_id>/download.pdf - Download completed PDF (if available)
+- GET /batch/<batch_id> - Get batch job status (all ranges)
+- GET /batch/<batch_id>/download.pdf - Download combined PDF of all ranges
 """
 
 import os
@@ -13,6 +16,7 @@ import json
 import uuid
 import zipfile
 import threading
+import logging
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file, g
 from flask_cors import CORS
@@ -21,6 +25,13 @@ from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from downloader import download_range
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -78,6 +89,7 @@ def get_real_ip():
 DEFAULT_LIMIT = os.environ.get("RATE_LIMIT_DEFAULT", "200 per hour")
 JOBS_CREATE_LIMIT = os.environ.get("RATE_LIMIT_JOBS_CREATE", "5 per hour")
 JOBS_CREATE_BURST = os.environ.get("RATE_LIMIT_JOBS_CREATE_BURST", "2 per minute")
+JOBS_BATCH_LIMIT = os.environ.get("RATE_LIMIT_JOBS_BATCH", "3 per hour")
 JOBS_STATUS_LIMIT = os.environ.get("RATE_LIMIT_JOBS_STATUS", "60 per minute")
 JOBS_DOWNLOAD_LIMIT = os.environ.get("RATE_LIMIT_JOBS_DOWNLOAD", "10 per minute")
 
@@ -119,7 +131,9 @@ def rate_limit_exceeded(e):
     return response
 
 JOBS_DIR = os.path.join(os.path.dirname(__file__), "jobs")
+BATCH_DIR = os.path.join(os.path.dirname(__file__), "jobs", "_batches")
 MAX_PAGES = 800
+MAX_RANGES_PER_BATCH = 10
 
 
 def get_job_path(job_id: str) -> str:
@@ -195,6 +209,126 @@ def create_pdf(job_id: str) -> str:
         f.write(img2pdf.convert(image_files))
 
     return pdf_path
+
+
+# ============================================================================
+# Batch Job Helpers
+# ============================================================================
+
+def get_batch_path(batch_id: str) -> str:
+    """Get the path to a batch folder."""
+    return os.path.join(BATCH_DIR, batch_id)
+
+
+def get_batch_status_path(batch_id: str) -> str:
+    """Get the path to a batch's status.json file."""
+    return os.path.join(get_batch_path(batch_id), "status.json")
+
+
+def read_batch_status(batch_id: str) -> dict:
+    """Read status.json for a batch."""
+    status_path = get_batch_status_path(batch_id)
+    if not os.path.exists(status_path):
+        return None
+    with open(status_path, "r") as f:
+        return json.load(f)
+
+
+def write_batch_status(batch_id: str, status: dict):
+    """Write status.json for a batch."""
+    status_path = get_batch_status_path(batch_id)
+    with open(status_path, "w") as f:
+        json.dump(status, f, indent=2)
+
+
+def create_combined_pdf(batch_id: str, job_ids: list) -> str:
+    """Create a combined PDF from all jobs in a batch."""
+    try:
+        import img2pdf
+    except ImportError:
+        logger.error(f"[Batch {batch_id[:8]}] img2pdf module not installed - cannot create combined PDF")
+        return None
+
+    batch_path = get_batch_path(batch_id)
+    pdf_path = os.path.join(batch_path, "combined.pdf")
+
+    all_image_files = []
+    for job_id in job_ids:
+        job_path = get_job_path(job_id)
+        images_path = os.path.join(job_path, "images")
+        if os.path.exists(images_path):
+            image_files = sorted([
+                os.path.join(images_path, f)
+                for f in os.listdir(images_path)
+                if f.endswith(".jpg")
+            ])
+            logger.info(f"[Batch {batch_id[:8]}] Found {len(image_files)} images in job {job_id[:8]}")
+            all_image_files.extend(image_files)
+
+    if not all_image_files:
+        logger.warning(f"[Batch {batch_id[:8]}] No images found for combined PDF")
+        return None
+
+    logger.info(f"[Batch {batch_id[:8]}] Combining {len(all_image_files)} images into PDF...")
+    with open(pdf_path, "wb") as f:
+        f.write(img2pdf.convert(all_image_files))
+
+    logger.info(f"[Batch {batch_id[:8]}] Combined PDF saved to {pdf_path}")
+    return pdf_path
+
+
+def run_batch_monitor(batch_id: str, job_ids: list):
+    """Background thread to monitor batch completion and create combined PDF."""
+    import time
+
+    logger.info(f"[Batch {batch_id[:8]}] Monitor started, tracking {len(job_ids)} jobs")
+
+    while True:
+        all_completed = True
+        any_failed = False
+        completed_count = 0
+
+        for job_id in job_ids:
+            status = read_status(job_id)
+            if status is None:
+                continue
+            if status["status"] in ("queued", "running"):
+                all_completed = False
+            elif status["status"] == "failed":
+                any_failed = True
+                completed_count += 1
+            elif status["status"] == "completed":
+                completed_count += 1
+
+        if all_completed:
+            logger.info(f"[Batch {batch_id[:8]}] All jobs completed ({completed_count}/{len(job_ids)})")
+            batch_status = read_batch_status(batch_id)
+            if batch_status:
+                if any_failed:
+                    batch_status["status"] = "completed_with_errors"
+                    logger.warning(f"[Batch {batch_id[:8]}] Completed with errors")
+                else:
+                    batch_status["status"] = "completed"
+                    logger.info(f"[Batch {batch_id[:8]}] Completed successfully")
+
+                # Try to create combined PDF
+                try:
+                    logger.info(f"[Batch {batch_id[:8]}] Creating combined PDF...")
+                    pdf_path = create_combined_pdf(batch_id, job_ids)
+                    batch_status["combined_pdf_available"] = pdf_path is not None
+                    if pdf_path:
+                        logger.info(f"[Batch {batch_id[:8]}] Combined PDF created: {pdf_path}")
+                    else:
+                        logger.warning(f"[Batch {batch_id[:8]}] Combined PDF creation returned None (img2pdf may not be installed)")
+                except Exception as e:
+                    logger.error(f"[Batch {batch_id[:8]}] Failed to create combined PDF: {str(e)}")
+                    batch_status["combined_pdf_available"] = False
+
+                batch_status["completed_at"] = datetime.now().isoformat()
+                write_batch_status(batch_id, batch_status)
+            break
+
+        time.sleep(2)
 
 
 def run_download_job(job_id: str, catalog_url: str, start_page: int, end_page: int):
@@ -329,6 +463,170 @@ def create_job():
     }), 201
 
 
+@app.route("/jobs/batch", methods=["POST"])
+@limiter.limit(JOBS_BATCH_LIMIT)
+def create_batch_job():
+    """Create a batch job with multiple page ranges."""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "Request body required"}), 400
+
+    catalog_url = data.get("catalog_url", "").strip()
+    ranges = data.get("ranges", [])
+
+    # Validate URL
+    if not catalog_url:
+        return jsonify({"error": "catalog_url is required"}), 400
+    if "catalog.archives.gov" not in catalog_url:
+        return jsonify({"error": "URL must be from catalog.archives.gov"}), 400
+
+    # Validate ranges
+    if not ranges or not isinstance(ranges, list):
+        return jsonify({"error": "ranges must be a non-empty array"}), 400
+    if len(ranges) > MAX_RANGES_PER_BATCH:
+        return jsonify({"error": f"Maximum {MAX_RANGES_PER_BATCH} ranges per batch"}), 400
+
+    validated_ranges = []
+    total_pages = 0
+    for i, r in enumerate(ranges):
+        try:
+            start_page = int(r.get("start_page", 1))
+            end_page = int(r.get("end_page", 100))
+        except (TypeError, ValueError, AttributeError):
+            return jsonify({"error": f"Range {i+1}: start_page and end_page must be integers"}), 400
+
+        if start_page < 1:
+            return jsonify({"error": f"Range {i+1}: start_page must be at least 1"}), 400
+        if end_page < start_page:
+            return jsonify({"error": f"Range {i+1}: end_page must be >= start_page"}), 400
+
+        page_count = end_page - start_page + 1
+        total_pages += page_count
+        validated_ranges.append({"start_page": start_page, "end_page": end_page})
+
+    if total_pages > MAX_PAGES:
+        return jsonify({"error": f"Total pages across all ranges cannot exceed {MAX_PAGES}"}), 400
+
+    # Create batch
+    batch_id = str(uuid.uuid4())
+    batch_path = get_batch_path(batch_id)
+    os.makedirs(batch_path, exist_ok=True)
+
+    # Create individual jobs for each range
+    job_ids = []
+    jobs_info = []
+    for i, r in enumerate(validated_ranges):
+        job_id = str(uuid.uuid4())
+        job_path = get_job_path(job_id)
+        os.makedirs(job_path, exist_ok=True)
+
+        status = {
+            "job_id": job_id,
+            "batch_id": batch_id,
+            "range_index": i,
+            "status": "queued",
+            "catalog_url": catalog_url,
+            "start_page": r["start_page"],
+            "end_page": r["end_page"],
+            "pages_done": 0,
+            "pages_total": r["end_page"] - r["start_page"] + 1,
+            "message": "Queued",
+            "created_at": datetime.now().isoformat(),
+            "zip_available": False,
+            "pdf_available": False
+        }
+        write_status(job_id, status)
+        append_log(job_id, f"Job created (batch {batch_id}): {catalog_url} pages {r['start_page']}-{r['end_page']}")
+
+        job_ids.append(job_id)
+        jobs_info.append({
+            "job_id": job_id,
+            "start_page": r["start_page"],
+            "end_page": r["end_page"],
+            "status_url": f"/jobs/{job_id}"
+        })
+
+        # Start background thread for this job
+        thread = threading.Thread(
+            target=run_download_job,
+            args=(job_id, catalog_url, r["start_page"], r["end_page"]),
+            daemon=True
+        )
+        thread.start()
+
+    # Initialize batch status
+    batch_status = {
+        "batch_id": batch_id,
+        "status": "running",
+        "catalog_url": catalog_url,
+        "ranges": validated_ranges,
+        "job_ids": job_ids,
+        "created_at": datetime.now().isoformat(),
+        "combined_pdf_available": False
+    }
+    write_batch_status(batch_id, batch_status)
+
+    # Start batch monitor thread
+    monitor_thread = threading.Thread(
+        target=run_batch_monitor,
+        args=(batch_id, job_ids),
+        daemon=True
+    )
+    monitor_thread.start()
+
+    return jsonify({
+        "batch_id": batch_id,
+        "jobs": jobs_info,
+        "status_url": f"/batch/{batch_id}"
+    }), 201
+
+
+@app.route("/batch/<batch_id>", methods=["GET"])
+@limiter.limit(JOBS_STATUS_LIMIT)
+def get_batch_status(batch_id: str):
+    """Get the status of a batch job including all individual jobs."""
+    batch_status = read_batch_status(batch_id)
+    if batch_status is None:
+        return jsonify({"error": "Batch not found"}), 404
+
+    # Enrich with individual job statuses
+    jobs = []
+    for job_id in batch_status.get("job_ids", []):
+        job_status = read_status(job_id)
+        if job_status:
+            jobs.append(job_status)
+
+    batch_status["jobs"] = jobs
+    return jsonify(batch_status)
+
+
+@app.route("/batch/<batch_id>/download.pdf", methods=["GET"])
+@limiter.limit(JOBS_DOWNLOAD_LIMIT)
+def download_batch_pdf(batch_id: str):
+    """Download the combined PDF for a completed batch."""
+    batch_status = read_batch_status(batch_id)
+    if batch_status is None:
+        return jsonify({"error": "Batch not found"}), 404
+
+    if batch_status["status"] not in ("completed", "completed_with_errors"):
+        return jsonify({"error": "Batch not completed"}), 400
+
+    if not batch_status.get("combined_pdf_available"):
+        return jsonify({"error": "Combined PDF not available"}), 404
+
+    pdf_path = os.path.join(get_batch_path(batch_id), "combined.pdf")
+    if not os.path.exists(pdf_path):
+        return jsonify({"error": "PDF file not found"}), 404
+
+    return send_file(
+        pdf_path,
+        as_attachment=True,
+        download_name=f"nara-batch-{batch_id[:8]}.pdf",
+        mimetype="application/pdf"
+    )
+
+
 @app.route("/jobs/<job_id>", methods=["GET"])
 @limiter.limit(JOBS_STATUS_LIMIT)
 def get_job_status(job_id: str):
@@ -397,4 +695,5 @@ def health_check():
 
 if __name__ == "__main__":
     os.makedirs(JOBS_DIR, exist_ok=True)
+    os.makedirs(BATCH_DIR, exist_ok=True)
     app.run(host="0.0.0.0", port=5001, debug=True)
