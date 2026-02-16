@@ -282,8 +282,10 @@ def run_batch_monitor(batch_id: str, job_ids: list):
     import time
 
     logger.info(f"[Batch {batch_id[:8]}] Monitor started, tracking {len(job_ids)} jobs")
+    poll_count = 0
 
     while True:
+        poll_count += 1
         all_completed = True
         any_failed = False
         completed_count = 0
@@ -291,6 +293,8 @@ def run_batch_monitor(batch_id: str, job_ids: list):
         for job_id in job_ids:
             status = read_status(job_id)
             if status is None:
+                # Status file not ready yet - job hasn't started
+                all_completed = False
                 continue
             if status["status"] in ("queued", "running"):
                 all_completed = False
@@ -300,7 +304,12 @@ def run_batch_monitor(batch_id: str, job_ids: list):
             elif status["status"] == "completed":
                 completed_count += 1
 
-        if all_completed:
+        # Log progress every 5 polls (10 seconds)
+        if poll_count % 5 == 0:
+            logger.info(f"[Batch {batch_id[:8]}] Progress: {completed_count}/{len(job_ids)} jobs done")
+
+        # Only mark complete when ALL jobs are actually done
+        if all_completed and completed_count == len(job_ids):
             logger.info(f"[Batch {batch_id[:8]}] All jobs completed ({completed_count}/{len(job_ids)})")
             batch_status = read_batch_status(batch_id)
             if batch_status:

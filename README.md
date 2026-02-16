@@ -15,6 +15,8 @@ A web application for downloading images from the National Archives (NARA) catal
 
 ## Quick Start
 
+> **New to this?** See [BEGINNER.md](BEGINNER.md) for a step-by-step guide with detailed instructions.
+
 ### Using Docker (Recommended)
 
 ```bash
@@ -194,6 +196,7 @@ This downloads a single PDF containing all images from all ranges in order.
 ```
 nara-image-scraper/
 ├── README.md
+├── BEGINNER.md             # Step-by-step beginner guide
 ├── docker-compose.yml
 ├── backend/
 │   ├── Dockerfile
