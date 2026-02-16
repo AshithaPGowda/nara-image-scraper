@@ -1,3 +1,16 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --pastel-blue: #dbeafe;
+  --pastel-cyan: #cffafe;
+  --pastel-sky: #e0f2fe;
+  --pastel-indigo: #e0e7ff;
+  --pastel-slate: #f1f5f9;
+}
+
+body {
+  background: linear-gradient(135deg, var(--pastel-blue) 0%, var(--pastel-sky) 50%, var(--pastel-cyan) 100%);
+  min-height: 100vh;
+}
